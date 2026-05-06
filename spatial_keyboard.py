@@ -19,27 +19,70 @@ sounds = {
     4: pygame.mixer.Sound(os.path.join(BASE_DIR, "pinky.wav"))
 }
 
-# 2. Create hand detector using skin color detection
-def get_hand_contours(frame):
-    """Detect hand regions using skin color in HSV"""
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    
-    # Skin color range in HSV
-    lower_skin = np.array([0, 15, 60], dtype=np.uint8)
-    upper_skin = np.array([20, 40, 200], dtype=np.uint8)
-    
-    mask = cv2.inRange(hsv, lower_skin, upper_skin)
-    
-    # Morphological operations to clean up the mask
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    
+# 2. Create hand detector   
+def build_skin_mask(frame):
+    """Build a more stable skin mask using HSV and YCrCb."""
+    blurred = cv2.GaussianBlur(frame, (7, 7), 0)
+
+    hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+    ycrcb = cv2.cvtColor(blurred, cv2.COLOR_BGR2YCrCb)
+
+    lower_hsv = np.array([0, 15, 60], dtype=np.uint8)
+    upper_hsv = np.array([25, 255, 255], dtype=np.uint8)
+    lower_ycrcb = np.array([0, 135, 85], dtype=np.uint8)
+    upper_ycrcb = np.array([255, 180, 135], dtype=np.uint8)
+
+    mask_hsv = cv2.inRange(hsv, lower_hsv, upper_hsv)
+    mask_ycrcb = cv2.inRange(ycrcb, lower_ycrcb, upper_ycrcb)
+    mask = cv2.bitwise_and(mask_hsv, mask_ycrcb)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+    mask = cv2.dilate(mask, kernel, iterations=1)
+
+    return mask
+
+
+def get_largest_hand_contour(mask):
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    return contours, mask
+    if not contours:
+        return None
+
+    largest = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(largest) < 3000:
+        return None
+
+    return largest
+
+
+def get_zone_activations(contour, threshold_y, zone_width, min_zone_points):
+    hull = cv2.convexHull(contour)
+    points = hull.reshape(-1, 2)
+
+    zone_counts = [0] * 5
+    for x, y in points:
+        if y > threshold_y:
+            zone_id = min(x // zone_width, 4)
+            zone_counts[zone_id] += 1
+
+    return [count >= min_zone_points for count in zone_counts], zone_counts
+
 
 # We need to track the state of each region independently so they don't stutter
-region_states = {0: False, 1: False, 2: False, 3: False, 4: False}
+HISTORY_LENGTH = 6
+region_states = {i: False for i in range(5)}
+region_history = {i: [False] * HISTORY_LENGTH for i in range(5)}
+
+# Calibration controls
+def nothing(x):
+    pass
+
+cv2.namedWindow('Controls', cv2.WINDOW_NORMAL)
+cv2.resizeWindow('Controls', 420, 90)
+cv2.createTrackbar('Threshold %', 'Controls', 60, 90, nothing)
+cv2.createTrackbar('Min Points', 'Controls', 3, 10, nothing)
+cv2.createTrackbar('Smooth', 'Controls', 3, 10, nothing)
 
 # 3. Start Webcam
 cap = cv2.VideoCapture(0)
@@ -51,48 +94,66 @@ while cap.isOpened():
 
     image = cv2.flip(image, 1)
     height, width, _ = image.shape
-    
-    # 4. Draw the Invisible Keyboard Line
-    threshold_y = int(height * 0.6) 
+
+    threshold_pct = cv2.getTrackbarPos('Threshold %', 'Controls')
+    min_zone_points = max(1, cv2.getTrackbarPos('Min Points', 'Controls'))
+    smooth_frames = max(1, cv2.getTrackbarPos('Smooth', 'Controls'))
+
+    threshold_y = int(height * max(30, threshold_pct) / 100)
     cv2.line(image, (0, threshold_y), (width, threshold_y), (0, 255, 0), 2)
-    
+    cv2.putText(
+        image,
+        f'Threshold {threshold_pct}%  Points {min_zone_points}  Smooth {smooth_frames}',
+        (10, 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
     # Divide screen into 5 zones for 5 fingers
     zone_width = width // 5
 
-    # 5. Get hand contours from skin color detection
-    contours, mask = get_hand_contours(image)
+    mask = build_skin_mask(image)
+    hand_contour = get_largest_hand_contour(mask)
 
-    # 6. Process each zone
+    if hand_contour is not None:
+        cv2.drawContours(image, [hand_contour], -1, (255, 0, 0), 2)
+        active_zones, counts = get_zone_activations(hand_contour, threshold_y, zone_width, min_zone_points)
+    else:
+        active_zones = [False] * 5
+        counts = [0] * 5
+
     for zone_id in range(5):
+        region_history[zone_id].pop(0)
+        region_history[zone_id].append(active_zones[zone_id])
+
+        is_active = sum(region_history[zone_id]) >= smooth_frames
+
+        if is_active and not region_states[zone_id]:
+            sounds[zone_id].play()
+
+        region_states[zone_id] = is_active
+
         zone_x_start = zone_id * zone_width
-        zone_x_end = (zone_id + 1) * zone_width
-        
-        # Check if any hand contour crosses threshold in this zone
-        touched = False
-        
-        for contour in contours:
-            # Get bounding box of contour
-            x, y, w, h = cv2.boundingRect(contour)
-            
-            # Check if contour is in this zone and below threshold
-            if zone_x_start <= x <= zone_x_end and y > threshold_y:
-                touched = True
-                break
-        
-        # Play sound if zone is touched and wasn't before
-        if touched:
-            if not region_states[zone_id]:
-                sounds[zone_id].play()
-                region_states[zone_id] = True
-        else:
-            region_states[zone_id] = False
-        
-        # Draw zone boundaries
-        cv2.line(image, (zone_x_start, 0), (zone_x_start, height), (100, 100, 100), 1)
+        zone_color = (0, 255, 0) if is_active else (100, 100, 100)
+        cv2.rectangle(image, (zone_x_start, 0), (zone_x_start + zone_width, height), zone_color, 1)
+        cv2.putText(
+            image,
+            str(counts[zone_id]),
+            (zone_x_start + 10, threshold_y - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            zone_color,
+            1,
+            cv2.LINE_AA,
+        )
 
     cv2.imshow('Vision-Tracked Spatial Keyboard', image)
-    
-    if cv2.waitKey(5) & 0xFF == 27: 
+    cv2.imshow('Skin Mask', mask)
+
+    if cv2.waitKey(5) & 0xFF == 27:
         break
 
 cap.release()
