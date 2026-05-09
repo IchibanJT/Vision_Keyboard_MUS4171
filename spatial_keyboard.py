@@ -21,25 +21,34 @@ sounds = {
 
 # 2. Create hand detector   
 def build_skin_mask(frame):
-    """Build a more stable skin mask using HSV and YCrCb."""
+    """Build a more stable skin mask using HSV and YCrCb with broader ranges."""
     blurred = cv2.GaussianBlur(frame, (7, 7), 0)
 
     hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
     ycrcb = cv2.cvtColor(blurred, cv2.COLOR_BGR2YCrCb)
 
-    lower_hsv = np.array([0, 15, 60], dtype=np.uint8)
-    upper_hsv = np.array([25, 255, 255], dtype=np.uint8)
-    lower_ycrcb = np.array([0, 135, 85], dtype=np.uint8)
-    upper_ycrcb = np.array([255, 180, 135], dtype=np.uint8)
-
-    mask_hsv = cv2.inRange(hsv, lower_hsv, upper_hsv)
+    # Broader HSV ranges to catch more skin tones
+    # Red hues (0-20) and light reds (160-180)
+    lower_hsv1 = np.array([0, 20, 40], dtype=np.uint8)
+    upper_hsv1 = np.array([20, 255, 255], dtype=np.uint8)
+    lower_hsv2 = np.array([160, 20, 40], dtype=np.uint8)
+    upper_hsv2 = np.array([180, 255, 255], dtype=np.uint8)
+    
+    mask_hsv1 = cv2.inRange(hsv, lower_hsv1, upper_hsv1)
+    mask_hsv2 = cv2.inRange(hsv, lower_hsv2, upper_hsv2)
+    mask_hsv = cv2.bitwise_or(mask_hsv1, mask_hsv2)
+    
+    # YCrCb ranges for skin detection
+    lower_ycrcb = np.array([0, 130, 80], dtype=np.uint8)
+    upper_ycrcb = np.array([255, 185, 140], dtype=np.uint8)
     mask_ycrcb = cv2.inRange(ycrcb, lower_ycrcb, upper_ycrcb)
+    
     mask = cv2.bitwise_and(mask_hsv, mask_ycrcb)
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
-    mask = cv2.dilate(mask, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.dilate(mask, kernel, iterations=2)
 
     return mask
 
@@ -50,7 +59,7 @@ def get_largest_hand_contour(mask):
         return None
 
     largest = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(largest) < 3000:
+    if cv2.contourArea(largest) < 1000:  # Lowered from 3000 for better sensitivity
         return None
 
     return largest
